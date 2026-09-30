@@ -309,3 +309,71 @@ python3 ~/project/private-copilot/scripts/query.py sql --q \
 - 分布类问题给出占比，让用户有直观感受。
 - **不要编造数据**。查询结果为空就说"这段时间没有记录"。
 - 如果结果里 `category_l1` 有"其他"且占比高，可以提醒一句"有些记录分类待细化"。
+
+---
+
+# 图表（用户要"看图"时）
+
+用户说「画个图」「饼图」「折线图」「趋势图」「占比」「可视化」时，**不要自己写脚本画**，
+直接用现成的 `chart.py`。它已经处理好了中文字体、标签防重叠、2x 高清。
+
+> ⚠️ **不要现场造轮子。** 曾经有过一次：agent 自己去 npm 装 `@napi-rs/canvas`、
+> 下载 17MB 中文字体、写了 60 行渲染代码 —— 结果写进 `/tmp`，重启就没了，
+> 而且只能画饼图。**先看这个技能，用现成命令。**
+
+## 命令
+
+```bash
+# 分类占比饼图
+python3 ~/project/private-copilot/scripts/chart.py pie \
+  --from 2026-10-01 --to 2026-10-07 --out /tmp/chart.png
+
+# 柱状图（by: category_l1 | platform | day）
+python3 ~/project/private-copilot/scripts/chart.py bar \
+  --from 2026-10-01 --to 2026-10-31 --by platform --out /tmp/chart.png
+
+# 折线图（metric: day | month）
+python3 ~/project/private-copilot/scripts/chart.py line \
+  --from 2026-10-01 --to 2026-10-31 --metric day --out /tmp/chart.png
+
+# 资产/负债/净资产三线对比
+python3 ~/project/private-copilot/scripts/chart.py finance --out /tmp/chart.png
+
+# 全部历史月度趋势
+python3 ~/project/private-copilot/scripts/chart.py trend --out /tmp/chart.png
+```
+
+## 怎么选图
+
+| 用户想问 | 用哪个 |
+|---|---|
+| 钱花在哪了 / 分类占比 | `pie` |
+| 各平台花了多少 / 每天花多少 | `bar` |
+| 最近花费走势 / 哪天花得多 | `line --metric day` |
+| 月度对比 | `line --metric month` 或 `trend` |
+| 资产/负债/净资产变化 | `finance` |
+
+## 发图
+
+`chart.py` 只生成本地 PNG。**必须再用 `message` 工具发出去**，用户才看得到：
+
+```
+message(action="send", mediaUrls=["/tmp/chart.png"], text="...")
+```
+
+## 三条硬要求
+
+1. **图 + 文字一起发。** 只发图不解释，用户还得自己看数字；只发字不发图，等于没画。
+   文字里给结论（总额、最大项、占比），图负责直观。
+2. **先把 JSON 里的数字读出来再组织话术。** `chart.py` 成功时会打印 JSON
+   （含 `total`、`count`、`items`），用里面的真实数字，**不要凭图估算**。
+3. **空数据不要画图。** 若 JSON 里 `count` 为 0 或 `items` 为空，
+   直接文字回复"这段时间没有记录"，别发一张空图。
+
+## 出问题时
+
+| 现象 | 原因 / 处理 |
+|---|---|
+| 报「渲染器不存在」 | 仓库没同步，检查 `scripts/chartgen/render.js` |
+| 报「渲染依赖未安装」 | 跑 `cd ~/project/private-copilot/scripts/chartgen && npm install` |
+| 图上中文是方块 | 缺字体，`sudo apt install fonts-noto-cjk` |

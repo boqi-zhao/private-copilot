@@ -1,0 +1,10 @@
+{
+  "name": "private-copilot-chartgen",
+  "private": true,
+  "version": "1.0.0",
+  "description": "离线图表渲染（@napi-rs/canvas，无需浏览器）",
+  "main": "render.js",
+  "dependencies": {
+    "@napi-rs/canvas": "^1.0.9"
+  }
+}

@@ -19,3 +19,6 @@ venv/
 .DS_Store
 ._*
 *.swp
+# Node 依赖（图表渲染，含 34MB 原生二进制）
+scripts/chartgen/node_modules/
+scripts/chartgen/package-lock.json
