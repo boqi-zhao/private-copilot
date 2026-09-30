@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """private-copilot 写入与查询。
 
-两类写入：
-    expense  —— 消费记录（打字或截图录入）
-    finance  —— 财务情况快照（时点）
+写入：
+    expense         —— 新增消费记录（打字或截图录入）
+    expense-update  —— 修改已有消费记录（用户在对话里回复纠正）
+    expense-last    —— 查看最近 5 笔，用于确定要改哪一笔
+    finance         —— 财务情况快照（时点）
 
 设计原则：Skill 管引导，脚本管兜底。
 LLM 可能不守规则，所以任何写入都必须过这一层白名单校验。
@@ -12,9 +14,11 @@ LLM 可能不守规则，所以任何写入都必须过这一层白名单校验�
     python3 validate.py init
     python3 validate.py categories
     python3 validate.py expense --json '{"occurred_at":"2026-10-01 12:30","category_l1":"餐饮","amount":38.5,"platform":"支付宝"}'
+    python3 validate.py expense-update --json '{"id":20,"category_l1":"交通"}'
+    python3 validate.py expense-last
     python3 validate.py finance --json '{"snapshot_at":"2026-09-30","alipay":1200.5,"wechat":300}'
 
-退出码：0 成功 / 1 校验失败 / 2 重复 / 3 用法错误
+退出码：0 成功 / 1 校验失败 / 2 重复 / 3 用法错误 / 4 目标不唯一
 """
 
 from __future__ import annotations
@@ -222,6 +226,141 @@ def insert_expense(payload: dict, dry_run: bool = False) -> tuple[int, dict]:
 
 
 # ---------------------------------------------------------------------
+# 修改：消费（回复纠正）
+#
+# 用户在飞书里回一句「分类改成交通」，agent 解析出要改的字段后走这里。
+# 关键设计：
+#   * 只允许改白名单字段，不允许 agent 直接写 SQL
+#   * 走与 insert 完全相同的分类/平台/金额校验
+#   * 改完写 ingest_log(action='update') 留痕，记录改前改后
+# ---------------------------------------------------------------------
+UPDATABLE_FIELDS = ("occurred_at", "category_l1", "category_l2",
+                    "amount", "platform", "raw_desc", "note")
+
+# 超过这个小时数就必须二次确认（由 Skill 层执行），脚本只做提示
+STALE_EDIT_HOURS = 24
+
+
+class AmbiguousTargetError(Exception):
+    """无法唯一确定要改哪一笔。"""
+
+    def __init__(self, candidates: list[dict]):
+        super().__init__("存在多笔候选，请指定 id")
+        self.candidates = candidates
+
+
+def find_expense_target(conn, payload: dict) -> dict:
+    """定位要修改的记录。
+
+    target_id 优先；没有则取最近一笔。允许多种参数名，避免 agent 猜错键名。
+    """
+    raw_id = payload.get("id")
+    if raw_id is None:
+        raw_id = payload.get("target_id")
+
+    if raw_id not in (None, ""):
+        try:
+            target_id = int(str(raw_id).strip())
+        except (TypeError, ValueError):
+            raise ValidationError(f"id 不是整数: {raw_id!r}")
+        row = conn.execute("SELECT * FROM expenses WHERE id=?", (target_id,)).fetchone()
+        if not row:
+            raise ValidationError(f"记录不存在: id={target_id}")
+        return dict(row)
+
+    # 没给 id：默认最近一笔，但如果刚写入后又被插入过，用户可能指的是别的
+    rows = conn.execute("SELECT * FROM expenses ORDER BY id DESC LIMIT 2").fetchall()
+    if not rows:
+        raise ValidationError("账本里还没有任何记录，无法修改")
+    return dict(rows[0])
+
+
+def update_expense(payload: dict, dry_run: bool = False) -> tuple[int, dict]:
+    cats, platforms = load_config()
+    conn = connect()
+    try:
+        before = find_expense_target(conn, payload)
+
+        sets: list[str] = []
+        values: list = []
+        changes: dict[str, dict] = {}
+
+        for field in UPDATABLE_FIELDS:
+            if field not in payload:
+                continue
+            raw = payload.get(field)
+
+            if field == "occurred_at":
+                new_val = normalize_time(raw, "消费时间")
+            elif field == "category_l1":
+                new_val, fell_back = validate_category(raw, cats)
+                if fell_back:
+                    raise ValidationError(
+                        f"一级分类 {raw!r} 不在受控词表中（受控词表：{'、'.join(cats)}）"
+                    )
+            elif field == "category_l2":
+                new_val = (str(raw).strip() or None) if raw is not None else None
+            elif field == "amount":
+                new_val = parse_amount(raw)
+            elif field == "platform":
+                if not raw or str(raw).strip() not in platforms:
+                    raise ValidationError(
+                        f"支付平台 {raw!r} 不在允许列表（{'、'.join(platforms)}）"
+                    )
+                new_val = str(raw).strip()
+            else:
+                new_val = (str(raw).strip() or None) if raw is not None else None
+
+            old_val = before.get(field)
+            # 归一化后比较，避免 "42" vs 42.0 误判成有改动
+            if old_val == new_val:
+                continue
+            changes[field] = {"from": old_val, "to": new_val}
+            sets.append(f"{field}=?")
+            values.append(new_val)
+
+        if not sets:
+            return before["id"], {"id": before["id"], "changed": {}, "noop": True,
+                                  "message": "没有需要修改的字段"}
+
+        # 改完是否会与已有记录重复（排除自己）
+        merged = dict(before)
+        for f, c in changes.items():
+            merged[f] = c["to"]
+        dup = conn.execute(
+            "SELECT id FROM expenses WHERE amount=? AND occurred_at=? AND category_l1=?"
+            " AND platform=? AND id<>?",
+            (merged["amount"], merged["occurred_at"], merged["category_l1"],
+             merged["platform"], before["id"]),
+        ).fetchone()
+        if dup:
+            log_action(conn, "expense-capture", "expenses", dup["id"], "reject_duplicate",
+                       {"reason": "修改后与其他记录重复", "target_id": before["id"],
+                        "changes": changes})
+            if not dry_run:
+                conn.commit()
+            raise DuplicateError(dup["id"], {"changes": changes,
+                                             "reason": "修改后会与这条重复"})
+
+        detail = {
+            "id": before["id"], "changes": changes, "dry_run": dry_run,
+            "before": {k: before.get(k) for k in UPDATABLE_FIELDS},
+        }
+        if dry_run:
+            detail["after"] = merged
+            return before["id"], detail
+
+        values.append(before["id"])
+        conn.execute(f"UPDATE expenses SET {', '.join(sets)} WHERE id=?", values)
+        detail["after"] = {k: merged.get(k) for k in UPDATABLE_FIELDS}
+        log_action(conn, "expense-capture", "expenses", before["id"], "update", detail)
+        conn.commit()
+        return before["id"], detail
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------
 # 写入：财务快照
 # ---------------------------------------------------------------------
 FINANCE_FIELDS = [
@@ -311,7 +450,9 @@ def insert_finance(payload: dict, dry_run: bool = False) -> tuple[int, dict]:
 # ---------------------------------------------------------------------
 def main() -> int:
     ap = argparse.ArgumentParser(description="private-copilot 写入校验")
-    ap.add_argument("kind", choices=["init", "expense", "finance", "categories"])
+    ap.add_argument("kind",
+                    choices=["init", "expense", "expense-update", "expense-last",
+                             "finance", "categories"])
     ap.add_argument("--json", dest="payload", help="待写入记录的 JSON")
     ap.add_argument("--dry-run", action="store_true", help="只校验不写入")
     args = ap.parse_args()
@@ -326,6 +467,20 @@ def main() -> int:
         print("平台:", " ".join(platforms))
         return 0
 
+    if args.kind == "expense-last":
+        # 给 agent 用：先看清楚最近几笔长什么样，再决定改哪一笔
+        conn = connect()
+        try:
+            rows = conn.execute(
+                "SELECT id, occurred_at, category_l1, category_l2, amount,"
+                " platform, raw_desc, created_at FROM expenses ORDER BY id DESC LIMIT 5"
+            ).fetchall()
+        finally:
+            conn.close()
+        print(json.dumps({"ok": True, "recent": [dict(r) for r in rows]},
+                         ensure_ascii=False))
+        return 0
+
     if not args.payload:
         print("错误：需要 --json", file=sys.stderr)
         return 3
@@ -338,6 +493,8 @@ def main() -> int:
     try:
         if args.kind == "expense":
             row_id, detail = insert_expense(payload, args.dry_run)
+        elif args.kind == "expense-update":
+            row_id, detail = update_expense(payload, args.dry_run)
         else:
             row_id, detail = insert_finance(payload, args.dry_run)
     except DuplicateError as e:
@@ -345,6 +502,10 @@ def main() -> int:
                           "existing_id": e.existing_id, "detail": e.detail},
                          ensure_ascii=False))
         return 2
+    except AmbiguousTargetError as e:
+        print(json.dumps({"ok": False, "reason": "ambiguous",
+                          "candidates": e.candidates}, ensure_ascii=False))
+        return 4
     except ValidationError as e:
         print(json.dumps({"ok": False, "reason": "invalid", "error": str(e)},
                          ensure_ascii=False))
