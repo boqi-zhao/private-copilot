@@ -1,0 +1,21 @@
+# 运行时数据（不入库）
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# 凭据
+.env
+*.key
+*.pem
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 系统
+.DS_Store
+._*
+*.swp
