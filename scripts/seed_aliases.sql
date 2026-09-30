@@ -1,0 +1,17 @@
+INSERT OR REPLACE INTO metric_aliases (alias, metric_key, unit) VALUES
+  ('a1c','hba1c','%'), ('hba1c','hba1c','%'), ('糖化血红蛋白','hba1c','%'), ('糖化hb','hba1c','%'),
+  ('总胆固醇','tc','mmol/L'), ('tc','tc','mmol/L'), ('chol','tc','mmol/L'),
+  ('甘油三酯','tg','mmol/L'), ('tg','tg','mmol/L'), ('三酰甘油','tg','mmol/L'),
+  ('低密度脂蛋白','ldl_c','mmol/L'), ('ldl-c','ldl_c','mmol/L'), ('ldl','ldl_c','mmol/L'),
+  ('高密度脂蛋白','hdl_c','mmol/L'), ('hdl-c','hdl_c','mmol/L'), ('hdl','hdl_c','mmol/L'),
+  ('谷丙转氨酶','alt','U/L'), ('alt','alt','U/L'), ('gpt','alt','U/L'),
+  ('谷草转氨酶','ast','U/L'), ('ast','ast','U/L'), ('got','ast','U/L'),
+  ('肌酐','creatinine','umol/L'), ('cr','creatinine','umol/L'), ('crea','creatinine','umol/L'),
+  ('尿酸','ua','umol/L'), ('ua','ua','umol/L'),
+  ('空腹血糖','glu_fasting','mmol/L'), ('glu','glu_fasting','mmol/L'), ('fpg','glu_fasting','mmol/L'),
+  ('白细胞','wbc','10^9/L'), ('wbc','wbc','10^9/L'),
+  ('血红蛋白','hgb','g/L'), ('hgb','hgb','g/L'), ('hb','hgb','g/L'),
+  ('血小板','plt','10^9/L'), ('plt','plt','10^9/L'),
+  ('收缩压','bp_sys','mmHg'), ('sbp','bp_sys','mmHg'),
+  ('舒张压','bp_dia','mmHg'), ('dbp','bp_dia','mmHg'),
+  ('体重','weight','kg'), ('wt','weight','kg');
