@@ -101,6 +101,7 @@ Concretely, for this workspace:
 |---|---|
 | 记账 / 消费录入 / 消费问数 | `~/.openclaw/workspace/skills/expense-capture/SKILL.md` |
 | 画图 / 饼图 / 折线图 / 趋势图 | 同上（`expense-capture` 的「图表」章节）；**不要自己写渲染脚本** |
+| 食物照片 / 记录吃了什么 | `~/.openclaw/workspace/skills/food-capture/SKILL.md` |
 | 财务总览（各账户余额快照） | `~/.openclaw/workspace/skills/finance-snapshot/SKILL.md` |
 | 体检报告 / 化验单 | `~/.openclaw/workspace/skills/health-report/SKILL.md` |
 

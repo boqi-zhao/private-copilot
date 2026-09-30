@@ -2,8 +2,8 @@
 -- SQLite 3。时间统一 ISO8601（本地时区）。
 --
 -- 设计要点：
---   1. 不存图片（媒体只保留可选的去重指纹，不落盘原图）。
---   2. 支持两种录入途径：打字（text）与截图（image），记在 source 字段。
+--   1. 消费/财务的截图不落盘（只提取数据）；但食物照片**要**落盘（见 meal_photos）。
+--   2. 支持两种录入途径：打字（text）与图片（image），记在 source 字段。
 --   3. 分类为两级：一级分类受控，二级分类自由。
 --   4. 财务情况表是"时点快照"，资产总计为计算列，不手工录入。
 
@@ -76,6 +76,34 @@ CREATE TABLE IF NOT EXISTS finance_snapshots (
 );
 
 CREATE INDEX IF NOT EXISTS idx_fin_snapshot ON finance_snapshots(snapshot_at);
+
+-- ---------------------------------------------------------------
+-- 食物记录（照片为主）
+-- ---------------------------------------------------------------
+-- 用途：用户随手拍的正餐 / 加餐照片。只记录"吃了什么"的影像证据，
+--       不做营养分析、不强制填字段，录入越轻越好。
+--
+-- 与 expenses 的区别：
+--   expenses 记的是"花了多少钱"（餐饮只是它的一级分类之一）。
+--   meal_photos 记的是"吃了什么"，多数时候根本没有金额（家里做的饭）。
+--   两张表独立，不互相引用；用户拍一张饭照不代表有消费。
+--
+-- 照片存储：文件落盘在 data/photos/YYYY/MM/（不入库），本表只存**相对路径**。
+--   相对根目录 = 仓库根（private-copilot/），例如 "data/photos/2026/09/abc.jpg"。
+--   存相对路径而非绝对路径，是为了让仓库搬到别的机器/目录后依然有效。
+CREATE TABLE IF NOT EXISTS meal_photos (
+    id          INTEGER PRIMARY KEY,
+    eaten_at    TEXT NOT NULL,               -- 用餐时间，非记录时间
+    photo_path  TEXT,                        -- 相对仓库根的照片路径（纯文字记录为 NULL）
+    note        TEXT,                        -- 备注（和谁吃、哪家店、好不好吃）
+    source      TEXT NOT NULL DEFAULT 'image'
+                CHECK (source IN ('image','text')),  -- 照片 / 纯文字描述
+    created_at  TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_meal_eaten ON meal_photos(eaten_at);
+-- 同一张照片不允许重复入库（防止同一条消息被处理两次）
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_meal_photo ON meal_photos(photo_path);
 
 -- ---------------------------------------------------------------
 -- 审计：所有写入留痕，便于回溯模型判断错误

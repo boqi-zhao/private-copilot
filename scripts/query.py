@@ -196,6 +196,40 @@ def q_finance(args) -> dict:
         conn.close()
 
 
+def q_meal(args) -> dict:
+    """食物照片记录。返回相对路径，agent 可拼成绝对路径发图。"""
+    import datetime
+    frm = norm_date(args.frm)
+    to = norm_date(args.to)
+    where, params = date_range_clause(frm, to, "eaten_at")
+    conn = connect_ro()
+    try:
+        rows = conn.execute(
+            f"""SELECT id, eaten_at, photo_path, note, source, created_at
+                FROM meal_photos WHERE {where}
+                ORDER BY eaten_at DESC LIMIT ?""",
+            (*params, args.limit),
+        ).fetchall()
+        items = [dict(r) for r in rows]
+
+        # 统计：按天聚合，便于"最近吃得怎么样"
+        by_day = conn.execute(
+            f"""SELECT substr(eaten_at,1,10) AS day, COUNT(*) AS n
+                FROM meal_photos WHERE {where}
+                GROUP BY day ORDER BY day DESC LIMIT 30""", params
+        ).fetchall()
+
+        # 照片绝对路径前缀：调用方（agent）需要绝对路径才能发送
+        root = str(DB_PATH.parent.parent)
+        for it in items:
+            if it.get("photo_path"):
+                it["photo_abs"] = f"{root}/{it['photo_path']}"
+        return {"count": len(items), "range": [frm, to],
+                "by_day": [dict(r) for r in by_day], "items": items}
+    finally:
+        conn.close()
+
+
 FORBIDDEN = re.compile(
     r"\b(insert|update|delete|drop|alter|create|replace|attach|detach|pragma|vacuum|reindex)\b",
     re.IGNORECASE,
@@ -244,6 +278,12 @@ def main() -> int:
     p.add_argument("--to", dest="to")
     p.add_argument("--limit", type=int, default=20)
     p.set_defaults(func=q_list)
+
+    p = sub.add_parser("meal", help="食物照片记录")
+    p.add_argument("--from", dest="frm")
+    p.add_argument("--to", dest="to")
+    p.add_argument("--limit", type=int, default=20)
+    p.set_defaults(func=q_meal)
 
     p = sub.add_parser("finance", help="财务快照趋势")
     p.add_argument("--limit", type=int, default=12)

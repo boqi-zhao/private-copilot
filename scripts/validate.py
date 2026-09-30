@@ -445,6 +445,147 @@ def insert_finance(payload: dict, dry_run: bool = False) -> tuple[int, dict]:
         conn.close()
 
 
+# ---- 插入：食物照片 ----
+#
+# 与 expense 的关键差异：
+#   * 消费记录金额必填；食物照片多数没有金额（家里做的饭），所以只要求时间和照片。
+#   * 照片文件由 store_photo() 落盘，表里存相对路径。
+#   * 去重按 photo_path（同一张图不允许入库两次），不按内容字段。
+
+PHOTO_ROOT_REL = "data/photos"          # 相对仓库根
+ALLOWED_IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".heic", ".heif"}
+MAX_PHOTO_BYTES = 25 * 1024 * 1024      # 单张 25MB 上限
+
+
+def _hash_file(path: Path) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()[:16]
+
+
+def store_photo(src: str, eaten_at: str) -> str:
+    """把照片从来源路径复制到 data/photos/YYYY/MM/，返回相对仓库根的路径。
+
+    为什么必须复制而不是直接用 inbound 路径：
+        ~/.openclaw/media/inbound/ 是 OpenClaw 自己的暂存区，
+        不保证长期存在（重启/清理会没）。食物照片是要长期留存的，
+        必须落到我们自己的目录。
+
+    文件名用内容哈希，天然去重：同一张图重复发只会有一份文件。
+    """
+    import shutil
+
+    src_path = Path(src).expanduser()
+    if not src_path.exists():
+        raise ValidationError(f"照片文件不存在: {src_path}")
+    if not src_path.is_file():
+        raise ValidationError(f"不是文件: {src_path}")
+
+    size = src_path.stat().st_size
+    if size == 0:
+        raise ValidationError(f"照片是空文件: {src_path}")
+    if size > MAX_PHOTO_BYTES:
+        raise ValidationError(
+            f"照片过大（{size/1024/1024:.1f}MB），上限 {MAX_PHOTO_BYTES//1024//1024}MB")
+
+    ext = src_path.suffix.lower()
+    if ext not in ALLOWED_IMAGE_EXT:
+        raise ValidationError(
+            f"不支持的图片格式 {ext!r}；允许: {', '.join(sorted(ALLOWED_IMAGE_EXT))}")
+
+    year, month = eaten_at[:4], eaten_at[5:7]
+    dest_dir = ROOT / PHOTO_ROOT_REL / year / month
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    digest = _hash_file(src_path)
+    dest_name = f"{eaten_at[:10].replace('-', '')}-{digest}{ext}"
+    dest = dest_dir / dest_name
+
+    if not dest.exists():
+        # 先写临时文件再 rename，避免复制一半被中断留下坏文件
+        tmp = dest.with_suffix(dest.suffix + ".part")
+        shutil.copy2(src_path, tmp)
+        tmp.replace(dest)
+
+    return str(dest.relative_to(ROOT))
+
+
+def insert_meal(payload: dict, dry_run: bool = False) -> tuple[int, dict]:
+    """写入一条食物记录。payload 需要 eaten_at + photo（本地路径）。
+
+    时间可以缺省：食物照片是"随拍随发"，默认取当前时间合理
+    （这与消费记录不同 —— 消费截图有交易时间，不该默认 now）。
+    """
+    raw_time = payload.get("eaten_at") or payload.get("time")
+    if raw_time:
+        eaten_at = normalize_time(raw_time, "用餐时间")
+    else:
+        eaten_at = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    note = (payload.get("note") or "").strip() or None
+
+    photo = (payload.get("photo") or payload.get("photo_path") or "").strip()
+    source = payload.get("source") or ("image" if photo else "text")
+    if source not in ("image", "text"):
+        raise ValidationError(f"source 只能是 image 或 text，收到 {source!r}")
+
+    if source == "image" and not photo:
+        raise ValidationError("照片记录必须提供 photo 路径")
+    if source == "text" and not note:
+        raise ValidationError("纯文字记录必须提供 note（否则这行没任何信息）")
+
+    # 落盘（dry_run 时只校验来源文件存在，不真复制）
+    if photo:
+        if dry_run:
+            p = Path(photo).expanduser()
+            if not p.exists():
+                raise ValidationError(f"照片文件不存在: {p}")
+            photo_rel = f"(dry-run 未落盘) {photo}"
+        else:
+            photo_rel = store_photo(photo, eaten_at)
+    else:
+        photo_rel = None
+
+    detail = {"eaten_at": eaten_at, "photo_path": photo_rel, "note": note,
+              "source": source}
+
+    if dry_run:
+        return 0, detail
+
+    conn = connect()
+    try:
+        existing = conn.execute(
+            "SELECT id FROM meal_photos WHERE photo_path = ?", (photo_rel,)
+        ).fetchone()
+        if existing:
+            log_action(conn, "food-capture", "meal_photos", existing["id"],
+                       "reject_duplicate", {"photo_path": photo_rel})
+            conn.commit()
+            raise DuplicateError(existing["id"], detail)
+
+        try:
+            cur = conn.execute(
+                "INSERT INTO meal_photos (eaten_at, photo_path, note, source)"
+                " VALUES (?,?,?,?)",
+                (eaten_at, photo_rel, note, source))
+        except sqlite3.IntegrityError as e:
+            # 老库的 photo_path 还是 NOT NULL（没跑迁移）时，纯文字记录会撞这里。
+            # 给出可操作的提示，而不是甩一个 traceback。
+            if "photo_path" in str(e) and photo_rel is None:
+                raise ValidationError(
+                    "数据库的 meal_photos.photo_path 仍是 NOT NULL，纯文字记录写不进去。"
+                    "请先执行: python3 scripts/migrate_meal_photo_nullable.py")
+            raise
+        row_id = int(cur.lastrowid)
+        log_action(conn, "food-capture", "meal_photos", row_id, "insert", detail)
+        conn.commit()
+        return row_id, detail
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------
@@ -452,7 +593,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="private-copilot 写入校验")
     ap.add_argument("kind",
                     choices=["init", "expense", "expense-update", "expense-last",
-                             "finance", "categories"])
+                             "finance", "meal", "meal-last", "categories"])
     ap.add_argument("--json", dest="payload", help="待写入记录的 JSON")
     ap.add_argument("--dry-run", action="store_true", help="只校验不写入")
     args = ap.parse_args()
@@ -465,6 +606,19 @@ def main() -> int:
         cats, platforms = load_config()
         print("一级分类:", " ".join(cats))
         print("平台:", " ".join(platforms))
+        return 0
+
+    if args.kind == "meal-last":
+        conn = connect()
+        try:
+            rows = conn.execute(
+                "SELECT id, eaten_at, photo_path, note, source, created_at"
+                " FROM meal_photos ORDER BY id DESC LIMIT 5"
+            ).fetchall()
+        finally:
+            conn.close()
+        print(json.dumps({"ok": True, "recent": [dict(r) for r in rows]},
+                         ensure_ascii=False))
         return 0
 
     if args.kind == "expense-last":
@@ -495,6 +649,8 @@ def main() -> int:
             row_id, detail = insert_expense(payload, args.dry_run)
         elif args.kind == "expense-update":
             row_id, detail = update_expense(payload, args.dry_run)
+        elif args.kind == "meal":
+            row_id, detail = insert_meal(payload, args.dry_run)
         else:
             row_id, detail = insert_finance(payload, args.dry_run)
     except DuplicateError as e:
