@@ -6,6 +6,7 @@
     expense-update  —— 修改已有消费记录（用户在对话里回复纠正）
     expense-last    —— 查看最近 5 笔，用于确定要改哪一笔
     finance         —— 财务情况快照（时点）
+    health          —— 健康指标（体检 / 化验 / 身体测量）
 
 设计原则：Skill 管引导，脚本管兜底。
 LLM 可能不守规则，所以任何写入都必须过这一层白名单校验。
@@ -17,6 +18,7 @@ LLM 可能不守规则，所以任何写入都必须过这一层白名单校验�
     python3 validate.py expense-update --json '{"id":20,"category_l1":"交通"}'
     python3 validate.py expense-last
     python3 validate.py finance --json '{"snapshot_at":"2026-09-30","alipay":1200.5,"wechat":300}'
+    python3 validate.py health --json '{"metric_key":"腰围","value":113,"unit":"cm","measured_at":"2026-10-01"}'
 
 退出码：0 成功 / 1 校验失败 / 2 重复 / 3 用法错误 / 4 目标不唯一
 """
@@ -136,6 +138,23 @@ def parse_amount(raw, field: str = "金额") -> float:
     if val < 0:
         raise ValidationError(f"{field}不能为负: {val}（负债填正数表示欠款金额）")
     return round(val, 2)
+
+
+def parse_number(raw, field: str = "数值") -> float:
+    """解析数值。与 parse_amount 不同，这里**允许负数**（部分指标可为负）。"""
+    if isinstance(raw, bool) or raw is None:
+        raise ValidationError(f"无法解析{field}: {raw!r}")
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    if isinstance(raw, str):
+        cleaned = re.sub(r"[^\d.\-+]", "", raw.replace(",", ""))
+        if not cleaned:
+            raise ValidationError(f"无法解析{field}: {raw!r}")
+        try:
+            return float(cleaned)
+        except ValueError:
+            raise ValidationError(f"无法解析{field}: {raw!r}")
+    raise ValidationError(f"{field}类型不支持: {type(raw).__name__}")
 
 
 def normalize_time(raw, field: str = "时间") -> str:
@@ -356,6 +375,175 @@ def update_expense(payload: dict, dry_run: bool = False) -> tuple[int, dict]:
         log_action(conn, "expense-capture", "expenses", before["id"], "update", detail)
         conn.commit()
         return before["id"], detail
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------
+# 写入：健康指标（体检 / 化验 / 身体测量）
+#
+# 与 expense 的差异：
+#   * 数值允许负数，单位必须一并记录（同一指标不同单位不可直接比较）。
+#   * metric_key 先过 metric_aliases 归一，表里没有的原样保留。
+#   * abnormal 由 ref_low/ref_high 自动推导，只有报告标了箭头又没有区间时才手工传。
+# ---------------------------------------------------------------------
+def insert_health(payload: dict, dry_run: bool = False) -> tuple[int, dict]:
+    conn = connect()
+    try:
+        raw_key = (payload.get("metric_key") or payload.get("name") or "").strip()
+        if not raw_key:
+            raise ValidationError("metric_key 缺失（指标的标准化名称）")
+
+        alias = conn.execute(
+            "SELECT metric_key, unit FROM metric_aliases WHERE alias=?", (raw_key,)
+        ).fetchone()
+        if alias:
+            metric_key, alias_unit = alias["metric_key"], alias["unit"]
+        else:
+            metric_key, alias_unit = raw_key, None   # 别名表没有 -> 原样保留
+
+        value = parse_number(payload.get("value"), "指标数值")
+
+        raw_time = payload.get("measured_at") or payload.get("date")
+        if raw_time:
+            measured_at = normalize_time(raw_time, "测量时间")[:10]
+        else:
+            measured_at = datetime.now().strftime("%Y-%m-%d")
+
+        def opt_float(name: str):
+            raw = payload.get(name)
+            if raw is None or raw == "":
+                return None
+            return parse_number(raw, name)
+
+        ref_low, ref_high = opt_float("ref_low"), opt_float("ref_high")
+
+        abnormal = payload.get("abnormal")
+        if abnormal is None and (ref_low is not None or ref_high is not None):
+            if ref_low is not None and value < ref_low:
+                abnormal = -1
+            elif ref_high is not None and value > ref_high:
+                abnormal = 1
+            else:
+                abnormal = 0
+
+        source = payload.get("source") or "text"
+        if source not in ("text", "image"):
+            source = "text"
+
+        detail = {
+            "metric_key": metric_key,
+            "display_name": payload.get("display_name") or raw_key,
+            "value": value, "unit": (payload.get("unit") or alias_unit or "").strip() or None,
+            "ref_low": ref_low, "ref_high": ref_high, "abnormal": abnormal,
+            "measured_at": measured_at, "panel": payload.get("panel"),
+            "institution": payload.get("institution"),
+            "source_ref": payload.get("source_ref"),
+            "image_path": payload.get("image_path"), "source": source,
+        }
+        if not alias:
+            detail["alias_missing"] = True
+
+        if dry_run:
+            return -1, detail
+
+        cur = conn.execute(
+            """INSERT INTO health_metrics
+               (metric_key, display_name, value, unit, ref_low, ref_high, abnormal,
+                measured_at, panel, institution, source_ref, image_path, source, note)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (metric_key, detail["display_name"], value, detail["unit"], ref_low, ref_high,
+             abnormal, measured_at, payload.get("panel"), payload.get("institution"),
+             payload.get("source_ref"), payload.get("image_path"), source,
+             payload.get("note")),
+        )
+        row_id = int(cur.lastrowid)
+        log_action(conn, "health-report", "health_metrics", row_id, "insert", detail)
+        conn.commit()
+        return row_id, detail
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------
+# 写入：身体尺寸（围度）
+#
+# 与 health 的差异：
+#   * 宽表而非长表：一次测量 = 一行，六项围度各占一列。
+#   * 允许缺项（NULL），**绝不补 0** —— 没量就是没量。
+#   * 单位固定 cm，不接受单位换算，也不接受明显离谱的值。
+# ---------------------------------------------------------------------
+BODY_FIELDS = [
+    ("waist", "腰围"), ("hip", "臀围"), ("chest", "胸围"),
+    ("bicep", "大臂围"), ("thigh", "大腿围"), ("calf", "小腿围"),
+]
+BODY_MIN_CM = 10.0      # 比这还小的围度一定是录错了（把 cm 当 m 之类的）
+BODY_MAX_CM = 300.0
+
+
+def insert_body(payload: dict, dry_run: bool = False) -> tuple[int, dict]:
+    conn = connect()
+    try:
+        raw_time = payload.get("measured_at") or payload.get("date") or payload.get("时间")
+        measured_at = normalize_time(raw_time, "测量日期")[:10]
+
+        values: dict[str, float] = {}
+        for col, label in BODY_FIELDS:
+            raw = payload.get(col, payload.get(label))
+            if raw is None or raw == "":
+                continue
+            val = parse_number(raw, label)
+            if not (BODY_MIN_CM <= val <= BODY_MAX_CM):
+                raise ValidationError(
+                    f"{label} {val} 超出合理范围（{BODY_MIN_CM:.0f}-{BODY_MAX_CM:.0f} cm），"
+                    "请确认是否把单位写错")
+            values[col] = round(val, 1)
+
+        if not values:
+            raise ValidationError(
+                "至少要提供一项围度（" + " / ".join(label for _, label in BODY_FIELDS) + "）")
+
+        source = payload.get("source") or "text"
+        if source not in ("text", "image"):
+            source = "text"
+
+        detail = {"measured_at": measured_at, "source": source, **values}
+
+        existing = conn.execute(
+            "SELECT * FROM body_measurements WHERE measured_at=?", (measured_at,)
+        ).fetchone()
+
+        if dry_run:
+            detail["action"] = "update" if existing else "insert"
+            if existing:
+                detail["existing"] = {c: existing[c] for c in dict(BODY_FIELDS) if existing[c] is not None}
+            return (int(existing["id"]) if existing else -1), detail
+
+        if existing:
+            # 同一天重复上报：只更新本次给出的项，未提及的项**保持原值**。
+            # （与 finance 快照同一原则：局部更新不能把别的字段清零）
+            sets = ",".join(f"{c}=?" for c in values)
+            conn.execute(
+                f"UPDATE body_measurements SET {sets}, source=?, raw_desc=COALESCE(?, raw_desc)"
+                " WHERE measured_at=?",
+                [*values.values(), source, payload.get("raw_desc"), measured_at],
+            )
+            row_id = int(existing["id"])
+            detail["action"] = "update"
+            log_action(conn, "body-measure", "body_measurements", row_id, "update", detail)
+        else:
+            cols = ["measured_at", *values.keys(), "source", "raw_desc", "note"]
+            vals = [measured_at, *values.values(), source,
+                    payload.get("raw_desc"), payload.get("note")]
+            cur = conn.execute(
+                f"INSERT INTO body_measurements ({','.join(cols)})"
+                f" VALUES ({','.join('?' * len(cols))})", vals)
+            row_id = int(cur.lastrowid)
+            detail["action"] = "insert"
+            log_action(conn, "body-measure", "body_measurements", row_id, "insert", detail)
+
+        conn.commit()
+        return row_id, detail
     finally:
         conn.close()
 
@@ -593,7 +781,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="private-copilot 写入校验")
     ap.add_argument("kind",
                     choices=["init", "expense", "expense-update", "expense-last",
-                             "finance", "meal", "meal-last", "categories"])
+                             "finance", "meal", "meal-last", "health", "body",
+                             "body-last", "categories"])
     ap.add_argument("--json", dest="payload", help="待写入记录的 JSON")
     ap.add_argument("--dry-run", action="store_true", help="只校验不写入")
     args = ap.parse_args()
@@ -614,6 +803,20 @@ def main() -> int:
             rows = conn.execute(
                 "SELECT id, eaten_at, photo_path, note, source, created_at"
                 " FROM meal_photos ORDER BY id DESC LIMIT 5"
+            ).fetchall()
+        finally:
+            conn.close()
+        print(json.dumps({"ok": True, "recent": [dict(r) for r in rows]},
+                         ensure_ascii=False))
+        return 0
+
+    if args.kind == "body-last":
+        conn = connect()
+        try:
+            rows = conn.execute(
+                "SELECT id, measured_at, waist, hip, chest, bicep, thigh, calf,"
+                " source, note, created_at"
+                " FROM body_measurements ORDER BY measured_at DESC LIMIT 5"
             ).fetchall()
         finally:
             conn.close()
@@ -651,8 +854,14 @@ def main() -> int:
             row_id, detail = update_expense(payload, args.dry_run)
         elif args.kind == "meal":
             row_id, detail = insert_meal(payload, args.dry_run)
-        else:
+        elif args.kind == "health":
+            row_id, detail = insert_health(payload, args.dry_run)
+        elif args.kind == "body":
+            row_id, detail = insert_body(payload, args.dry_run)
+        elif args.kind == "finance":
             row_id, detail = insert_finance(payload, args.dry_run)
+        else:
+            raise SystemExit(f"未知写入类型: {args.kind}")
     except DuplicateError as e:
         print(json.dumps({"ok": False, "reason": "duplicate",
                           "existing_id": e.existing_id, "detail": e.detail},

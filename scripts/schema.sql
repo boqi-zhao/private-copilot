@@ -106,6 +106,37 @@ CREATE INDEX IF NOT EXISTS idx_meal_eaten ON meal_photos(eaten_at);
 CREATE UNIQUE INDEX IF NOT EXISTS uniq_meal_photo ON meal_photos(photo_path);
 
 -- ---------------------------------------------------------------
+-- 身体尺寸（围度）
+-- ---------------------------------------------------------------
+-- 用户要求单独一张表记录身体尺寸：腰围、臀围、胸围、大臂围、大腿围、小腿围。
+--
+-- 为什么是**宽表**（一圈一列）而不是塞进 health_metrics 长表：
+--   用户明确选择了这个建模。围度是一组"每次一起量"的指标，
+--   宽表下一行 = 一次完整测量，看趋势时直接横向读一眼，不用做透视。
+--
+-- 所有列**可空**：穿戴设备/卷尺随手量，经常只量得到一两项。
+--   缺项就是 NULL，**不要填 0** —— 0 cm 的腰围是假数据。
+--
+-- 单位固定 cm，不做单位换算（围度没有第二种常用单位）。
+CREATE TABLE IF NOT EXISTS body_measurements (
+    id          INTEGER PRIMARY KEY,
+    measured_at TEXT NOT NULL UNIQUE,        -- 测量日期（一天一次，重复写即覆盖）
+    waist       REAL,                        -- 腰围 cm
+    hip         REAL,                        -- 臀围 cm
+    chest       REAL,                        -- 胸围 cm
+    bicep       REAL,                        -- 大臂围 cm
+    thigh       REAL,                        -- 大腿围 cm
+    calf        REAL,                        -- 小腿围 cm
+    source      TEXT NOT NULL DEFAULT 'text'
+                CHECK (source IN ('text','image')),
+    raw_desc    TEXT,                        -- 用户原始描述
+    note        TEXT,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_body_measured ON body_measurements(measured_at);
+
+-- ---------------------------------------------------------------
 -- 审计：所有写入留痕，便于回溯模型判断错误
 -- ---------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS ingest_log (

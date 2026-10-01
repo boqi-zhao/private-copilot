@@ -147,3 +147,19 @@ sqlite3 ~/project/private-copilot/data/copilot.db \
 - **化验单、体检报告** → 本技能
 - **医院缴费单、挂号费、药店小票** → `expense-capture`（记 `医疗` 类）
 - 一张图上同时有费用和指标（如体检套餐收据）→ 问用户要记哪边，或两边都记并说明
+
+## 与 body-measure 的边界
+
+**围度不走本技能。** 腰围/臀围/胸围/大臂围/大腿围/小腿围有自己的表
+（`body_measurements`，宽表，一圈一列）和技能 `body-measure`。
+
+| 指标 | 走哪个 |
+|---|---|
+| 腰围、臀围、胸围、臂围、腿围 | `body-measure` |
+| 体重、血压、血糖、血脂、肝肾功能 | 本技能 |
+
+历史说明：`metric_aliases` 里曾登记 `waist` / `hip` / `chest` 三个别名，
+当时围度是作为长表指标写进 `health_metrics` 的。现已迁移到
+`body_measurements`，那三条别名**保留但不再使用**（不影响新数据）。
+
+一张图上同时有体重和围度 → 分开记，并在回复里说明。
