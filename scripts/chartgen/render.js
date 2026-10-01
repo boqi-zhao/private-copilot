@@ -140,12 +140,21 @@ function drawPie(d) {
   const total = items.reduce((s, x) => s + x.v, 0) || 1;
 
   const cx = 300, cy = 375, r = 175;
+  // 只有一项时 ang 恰好等于 2PI，而 @napi-rs/canvas 对
+  // arc(-PI/2, -PI/2 + 2PI) 这种「非零起点 + 整 2PI 扫角」会画出空路径 ——
+  // 表现是饼图整个消失（只剩图例）。把扫角夹到略小于 2PI 即可，
+  // 缺口约 1e-6 弧度，远小于一个像素，肉眼不可见。
+  const TWO_PI = Math.PI * 2;
   let start = -Math.PI / 2;
   items.forEach((s, i) => {
-    const ang = (s.v / total) * Math.PI * 2;
+    const ang = (s.v / total) * TWO_PI;
     ctx.beginPath();
-    ctx.moveTo(cx, cy);
-    ctx.arc(cx, cy, r, start, start + ang);
+    if (items.length === 1) {
+      ctx.arc(cx, cy, r, 0, TWO_PI - 1e-6);   // 整圆：不走 moveTo 圆心
+    } else {
+      ctx.moveTo(cx, cy);
+      ctx.arc(cx, cy, r, start, start + Math.min(ang, TWO_PI - 1e-6));
+    }
     ctx.closePath();
     ctx.fillStyle = colorOf(i);
     ctx.fill();

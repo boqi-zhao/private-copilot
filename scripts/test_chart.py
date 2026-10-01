@@ -18,6 +18,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 CHART = ROOT / "scripts" / "chart.py"
+CHARTGEN = ROOT / "scripts" / "chartgen"
 REAL_DB = (ROOT / "data" / "copilot.db").resolve()
 
 FAILED = []
@@ -94,6 +95,32 @@ def png_size(p: Path):
     return w, h
 
 
+def pixel_at(p: Path, x: int, y: int):
+    """读回 PNG 上某个像素的 RGB。
+
+    图是压缩过的，没法直接 grep 颜色，所以借渲染器同一套 canvas 来解码 ——
+    比在测试里手写一遍 PNG 反滤波靠谱，也不用给服务器装 Pillow。
+    """
+    code = (
+        "const {createCanvas,loadImage}=require('@napi-rs/canvas');"
+        "loadImage(process.argv[1]).then(im=>{"
+        "const c=createCanvas(im.width,im.height);const g=c.getContext('2d');"
+        "g.drawImage(im,0,0);"
+        "const d=g.getImageData(+process.argv[2],+process.argv[3],1,1).data;"
+        "console.log(d[0]+' '+d[1]+' '+d[2]);});"
+    )
+    r = subprocess.run(["node", "-e", code, str(p), str(x), str(y)],
+                       capture_output=True, text=True, cwd=CHARTGEN)
+    if r.returncode != 0 or not r.stdout.strip():
+        return None
+    return tuple(int(v) for v in r.stdout.split())
+
+
+def is_colorful(px) -> bool:
+    """扇形是饱和色，白底和灰色小字都不是。用来判断「图上到底画没画东西」。"""
+    return px is not None and (max(px) - min(px)) > 40
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -112,6 +139,9 @@ def main() -> int:
             j = json.loads(r.stdout)
             check("pie total correct", abs(j["total"] - 1075.0) < 0.01, str(j["total"]))
             check("pie items=4", j["items"] == 4, str(j["items"]))
+        # 圆内左侧一点（逻辑坐标 225,375 -> 2x 设备 450,750），必须落在扇形上
+        check("pie 真的画出了扇形（非白底）", is_colorful(pixel_at(out, 450, 750)),
+              str(pixel_at(out, 450, 750)))
 
         print("== bar ==")
         out = tmp / "bar.png"
@@ -157,6 +187,28 @@ def main() -> int:
         r = run(["trend", "--out", str(out)], db, tmp)
         check("trend exit 0", r.returncode == 0, r.stderr[:200])
         check("trend png", png_size(out) == (1920, 1240))
+
+        print("== 单分类饼图：整圆必须画出来（回归） ==")
+        # 只有一类时 ang 恰好是 2PI。@napi-rs/canvas 对
+        # arc(-PI/2, -PI/2+2PI) 会画出空路径，整个饼图消失、只剩图例。
+        # 一个月只有一种开销时很容易撞上，所以单独钉一条。
+        db4 = tmp / "t4.db"
+        seed(db4)
+        c = sqlite3.connect(db4)
+        c.execute("DELETE FROM expenses WHERE category_l1 <> '餐饮'")
+        c.commit(); c.close()
+        # 只剩 3 条餐饮：35 + 62 + 28 = 125
+        out = tmp / "pie1.png"
+        r = run(["pie", "--from", "2026-10-01", "--to", "2026-10-07",
+                 "--out", str(out)], db4, tmp)
+        check("single-category pie exit 0", r.returncode == 0, r.stderr[:200])
+        check("single-category png", png_size(out) == (1920, 1240), str(png_size(out)))
+        if r.returncode == 0:
+            j = json.loads(r.stdout)
+            check("single-category items=1", j["items"] == 1, str(j["items"]))
+            check("single-category total 125", abs(j["total"] - 125.0) < 0.01, str(j["total"]))
+            px = pixel_at(out, 450, 750)
+            check("单分类饼图圆内有颜色（不是空图）", is_colorful(px), str(px))
 
         print("== empty range（不该崩） ==")
         out = tmp / "empty.png"
