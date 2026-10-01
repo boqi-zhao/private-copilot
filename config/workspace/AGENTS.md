@@ -122,6 +122,13 @@ Keep local tool and environment notes in this section so they stay separate from
 
 Record camera names, SSH hosts and users, preferred voices and speakers, and device nicknames here.
 
+**Model:** this assistant runs on `opencode-go/deepseek-v4.1-flash` (OpenCode Go
+subscription, base URL `https://opencode.ai/zen/go/v1/chat/completions`). Use the
+built-in `opencode-go` provider — **never hand-write a provider with this baseUrl**,
+because OpenCode Go rejects requests that lack the `x-opencode-session` header, and
+only the built-in plugin injects it. Full details and rollback: `docs/模型配置.md`
+in the private-copilot repo.
+
 **Voice storytelling:** when `sag` (ElevenLabs TTS) is available, use voice for stories, movie summaries, and storytime.
 
 **Platform formatting:**
